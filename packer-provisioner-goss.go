@@ -1,19 +1,23 @@
+//go:generate mapstructure-to-hcl2 -type Config
+
 package main
 
 import (
+    "context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
+    "github.com/hashicorp/hcl/v2/hcldec"
+    "github.com/hashicorp/packer/packer"
+    "github.com/hashicorp/packer/packer/plugin"
 	"github.com/hashicorp/packer/helper/config"
-	"github.com/hashicorp/packer/packer"
-	"github.com/hashicorp/packer/packer/plugin"
 	"github.com/hashicorp/packer/template/interpolate"
 )
 
-// GossConfig holds the config data coming in from the packer template
-type GossConfig struct {
+// Config holds the config data coming in from the packer template
+type Config struct {
 	// Goss installation
 	Version      string
 	Arch         string
@@ -63,21 +67,25 @@ type GossConfig struct {
 var validFormats = []string{"documentation", "json", "json_oneline", "junit", "nagios", "nagios_verbose", "rspecish", "silent", "tap"}
 
 // Provisioner implements a packer Provisioner
-type Provisioner struct {
-	config GossConfig
+type GossProvisioner struct {
+	config Config
+}
+
+func (b *GossProvisioner) ConfigSpec() hcldec.ObjectSpec {
+	return b.config.FlatMapstructure().HCL2Spec()
 }
 
 func main() {
-	server, err := plugin.Server()
-	if err != nil {
-		panic(err)
-	}
-	server.RegisterProvisioner(new(Provisioner))
-	server.Serve()
+    server, err := plugin.Server()
+    if err != nil {
+        panic(err)
+    }
+    server.RegisterProvisioner(new(GossProvisioner))
+    server.Serve()
 }
 
 // Prepare gets the Goss Privisioner ready to run
-func (p *Provisioner) Prepare(raws ...interface{}) error {
+func (p *GossProvisioner) Prepare(raws ...interface{}) error {
 	err := config.Decode(&p.config, &config.DecodeOpts{
 		Interpolate:        true,
 		InterpolateContext: &p.config.ctx,
@@ -158,8 +166,8 @@ func (p *Provisioner) Prepare(raws ...interface{}) error {
 	return nil
 }
 
-// Provision runs the Goss Provisioner
-func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
+// Provision runs the Goss GossProvisioner
+func (p *GossProvisioner) Provision(ctx context.Context, ui packer.Ui, comm packer.Communicator, generatedData map[string]interface{}) error {
 	ui.Say("Provisioning with Goss")
 
 	if !p.config.SkipInstall {
@@ -221,13 +229,14 @@ func (p *Provisioner) Provision(ui packer.Ui, comm packer.Communicator) error {
 }
 
 // Cancel just exists when provision is cancelled
-func (p *Provisioner) Cancel() {
+func (p *GossProvisioner) Cancel() {
 	os.Exit(0)
 }
 
 // installGoss downloads the Goss binary on the remote host
-func (p *Provisioner) installGoss(ui packer.Ui, comm packer.Communicator) error {
+func (p *GossProvisioner) installGoss(ui packer.Ui, comm packer.Communicator) error {
 	ui.Message(fmt.Sprintf("Installing Goss from, %s", p.config.URL))
+    ctx := context.TODO()
 
 	cmd := &packer.RemoteCmd{
 		// Fallback on wget if curl failed for any reason (such as not being installed)
@@ -237,13 +246,13 @@ func (p *Provisioner) installGoss(ui packer.Ui, comm packer.Communicator) error 
 			p.sslFlag("wget"), p.userPass("wget"), p.config.DownloadPath, p.config.URL),
 	}
 	ui.Message(fmt.Sprintf("Downloading Goss to %s", p.config.DownloadPath))
-	if err := cmd.StartWithUi(comm, ui); err != nil {
+	if err := cmd.RunWithUi(ctx, comm, ui); err != nil {
 		return fmt.Errorf("Unable to download Goss: %s", err)
 	}
 	cmd = &packer.RemoteCmd{
 		Command: fmt.Sprintf("chmod 555 %s && %s --version", p.config.DownloadPath, p.config.DownloadPath),
 	}
-	if err := cmd.StartWithUi(comm, ui); err != nil {
+	if err := cmd.RunWithUi(ctx, comm, ui); err != nil {
 		return fmt.Errorf("Unable to install Goss: %s", err)
 	}
 
@@ -251,17 +260,19 @@ func (p *Provisioner) installGoss(ui packer.Ui, comm packer.Communicator) error 
 }
 
 // runGoss runs the Goss tests
-func (p *Provisioner) runGoss(ui packer.Ui, comm packer.Communicator) error {
+func (p *GossProvisioner) runGoss(ui packer.Ui, comm packer.Communicator) error {
 	goss := fmt.Sprintf("%s", p.config.DownloadPath)
+    ctx := context.TODO()
+
 	cmd := &packer.RemoteCmd{
 		Command: fmt.Sprintf(
 			"cd %s && %s %s %s %s %s validate %s",
 			p.config.RemotePath, p.enableSudo(), goss, p.config.GossFile, p.vars(), p.debug(), p.format()),
 	}
-	if err := cmd.StartWithUi(comm, ui); err != nil {
+	if err := cmd.RunWithUi(ctx, comm, ui); err != nil {
 		return err
 	}
-	if cmd.ExitStatus != 0 {
+	if cmd.ExitStatus() != 0 {
 		return fmt.Errorf("goss non-zero exit status")
 	}
 	ui.Say(fmt.Sprintf("Goss tests ran successfully"))
@@ -269,28 +280,28 @@ func (p *Provisioner) runGoss(ui packer.Ui, comm packer.Communicator) error {
 }
 
 // debug returns the debug flag if debug is configured
-func (p *Provisioner) debug() string {
+func (p *GossProvisioner) debug() string {
 	if p.config.Debug {
 		return "-d"
 	}
 	return ""
 }
 
-func (p *Provisioner) format() string {
+func (p *GossProvisioner) format() string {
 	if p.config.Format != "" {
 		return fmt.Sprintf("-f %s", p.config.Format)
 	}
 	return ""
 }
 
-func (p *Provisioner) vars() string {
+func (p *GossProvisioner) vars() string {
 	if p.config.VarsFile != "" {
 		return fmt.Sprintf("--vars %s", filepath.ToSlash(filepath.Join(p.config.RemotePath, filepath.Base(p.config.VarsFile))))
 	}
 	return ""
 }
 
-func (p *Provisioner) sslFlag(cmdType string) string {
+func (p *GossProvisioner) sslFlag(cmdType string) string {
 	if p.config.SkipSSLChk {
 		switch(cmdType) {
 		case "curl":
@@ -305,7 +316,7 @@ func (p *Provisioner) sslFlag(cmdType string) string {
 }
 
 // enable sudo if required
-func (p *Provisioner) enableSudo() string {
+func (p *GossProvisioner) enableSudo() string {
 	if p.config.UseSudo {
 		return "sudo"
 	}
@@ -313,7 +324,7 @@ func (p *Provisioner) enableSudo() string {
 }
 
 // Deal with curl & wget username and password
-func (p *Provisioner) userPass(cmdType string) string {
+func (p *GossProvisioner) userPass(cmdType string) string {
 	if p.config.Username != "" {
 		switch(cmdType) {
 		case "curl":
@@ -334,22 +345,24 @@ func (p *Provisioner) userPass(cmdType string) string {
 }
 
 // createDir creates a directory on the remote server
-func (p *Provisioner) createDir(ui packer.Ui, comm packer.Communicator, dir string) error {
+func (p *GossProvisioner) createDir(ui packer.Ui, comm packer.Communicator, dir string) error {
 	ui.Message(fmt.Sprintf("Creating directory: %s", dir))
+    ctx := context.TODO()
+
 	cmd := &packer.RemoteCmd{
 		Command: fmt.Sprintf("mkdir -p '%s'", dir),
 	}
-	if err := cmd.StartWithUi(comm, ui); err != nil {
+	if err := cmd.RunWithUi(ctx, comm, ui); err != nil {
 		return err
 	}
-	if cmd.ExitStatus != 0 {
+	if cmd.ExitStatus() != 0 {
 		return fmt.Errorf("non-zero exit status")
 	}
 	return nil
 }
 
 // uploadFile uploads a file
-func (p *Provisioner) uploadFile(ui packer.Ui, comm packer.Communicator, dst, src string) error {
+func (p *GossProvisioner) uploadFile(ui packer.Ui, comm packer.Communicator, dst, src string) error {
 	f, err := os.Open(src)
 	if err != nil {
 		return fmt.Errorf("Error opening: %s", err)
@@ -363,7 +376,7 @@ func (p *Provisioner) uploadFile(ui packer.Ui, comm packer.Communicator, dst, sr
 }
 
 // uploadDir uploads a directory
-func (p *Provisioner) uploadDir(ui packer.Ui, comm packer.Communicator, dst, src string) error {
+func (p *GossProvisioner) uploadDir(ui packer.Ui, comm packer.Communicator, dst, src string) error {
 	var ignore []string
 	if err := p.createDir(ui, comm, dst); err != nil {
 		return err

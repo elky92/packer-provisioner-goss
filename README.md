@@ -48,7 +48,12 @@ There is an example packer build with goss tests in the `example/` directory.
   }
 ]
 ```
+## Build
 
+1. If you add or change a field of Config you will need to run the `go generate` command for generating new **packer-provisioner-goss.hcl2spec.go**
+
+2. Run build command - `env GOOS=linux GOARCH=amd64 go build`
+  
 ## Installation
 
 1. Download the most recent release for your platform from [here.](https://github.com/YaleUniversity/packer-provisioner-goss/releases).

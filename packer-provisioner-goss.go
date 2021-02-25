@@ -3,17 +3,25 @@
 package main
 
 import (
-    "context"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+    "strings"
 
-    "github.com/hashicorp/hcl/v2/hcldec"
-    "github.com/hashicorp/packer/packer"
-    "github.com/hashicorp/packer/packer/plugin"
-	"github.com/hashicorp/packer/helper/config"
-	"github.com/hashicorp/packer/template/interpolate"
+	"github.com/hashicorp/hcl/v2/hcldec"
+	"github.com/hashicorp/packer-plugin-sdk/packer"
+	"github.com/hashicorp/packer-plugin-sdk/plugin"
+	"github.com/hashicorp/packer-plugin-sdk/template/config"
+	"github.com/hashicorp/packer-plugin-sdk/template/interpolate"
+)
+
+const (
+    linux             = "Linux"
+    windows           = "Windows"
+    version           = "1.0.0"
+    arch              = "amd64"
 )
 
 // Config holds the config data coming in from the packer template
@@ -22,22 +30,27 @@ type Config struct {
 	Version      string
 	Arch         string
 	URL          string
-	DownloadPath string
 	Username     string
 	Password     string
-	SkipInstall  bool
+    Debug        bool
+    Inspect      bool
+	Tests        []string
 
-	// Enable debug for goss (defaults to false)
-	Debug bool
+    DownloadPath string  `mapstructure:"download_path"`
+    TargetOs     string  `mapstructure:"target_os"`
 
-	// An array of tests to run.
-	Tests []string
+    // Goss options for retry and timeouts
+    RetryTimeout string `mapstructure:"retry_timeout"`
+    Sleep        string `mapstructure:"sleep"`
+
+    // Skip Install
+    SkipInstall  bool    `mapstructure:"skip_install"`
 
 	// Use Sudo
 	UseSudo bool `mapstructure:"use_sudo"`
 
 	// skip ssl check flag
-	SkipSSLChk   bool `mapstructure:"skip_ssl"`
+	SkipSSLChk bool `mapstructure:"skip_ssl"`
 
 	// The --gossfile flag
 	GossFile string `mapstructure:"goss_file"`
@@ -47,6 +60,9 @@ type Config struct {
 	// Must be one of the files contained in the Tests array.
 	// Can be YAML or JSON.
 	VarsFile string `mapstructure:"vars_file"`
+
+    // Optional env variables
+    VarsEnv map[string]string `mapstructure:"vars_env"`
 
 	// The remote folder where the goss tests will be uploaded to.
 	// This should be set to a pre-existing directory, it defaults to /tmp
@@ -61,27 +77,33 @@ type Config struct {
 	// Default:   rspecish
 	Format string `mapstructure:"format"`
 
+    // The format options to use for printing test output
+    // Available: [perfdata verbose pretty]
+    // Default:   verbose
+    FormatOptions string `mapstructure:"format_options"`
+
 	ctx interpolate.Context
 }
 
 var validFormats = []string{"documentation", "json", "json_oneline", "junit", "nagios", "nagios_verbose", "rspecish", "silent", "tap"}
+var validFormatOptions = []string{"perfdata", "verbose", "pretty"}
 
 // Provisioner implements a packer Provisioner
 type GossProvisioner struct {
 	config Config
 }
 
-func (b *GossProvisioner) ConfigSpec() hcldec.ObjectSpec {
-	return b.config.FlatMapstructure().HCL2Spec()
+func main() {
+	server, err := plugin.Server()
+	if err != nil {
+		panic(err)
+	}
+	server.RegisterProvisioner(new(GossProvisioner))
+	server.Serve()
 }
 
-func main() {
-    server, err := plugin.Server()
-    if err != nil {
-        panic(err)
-    }
-    server.RegisterProvisioner(new(GossProvisioner))
-    server.Serve()
+func (b *GossProvisioner) ConfigSpec() hcldec.ObjectSpec {
+    return b.config.FlatMapstructure().HCL2Spec()
 }
 
 // Prepare gets the Goss Privisioner ready to run
@@ -98,22 +120,29 @@ func (p *GossProvisioner) Prepare(raws ...interface{}) error {
 	}
 
 	if p.config.Version == "" {
-		p.config.Version = "0.3.2"
+		p.config.Version = "0.3.9"
 	}
 
 	if p.config.Arch == "" {
 		p.config.Arch = "amd64"
 	}
 
-	if p.config.URL == "" {
-		p.config.URL = fmt.Sprintf(
-			"https://github.com/aelsabbahy/goss/releases/download/v%s/goss-linux-%s",
-			p.config.Version, p.config.Arch)
-	}
+    if p.config.TargetOs == "" {
+        p.config.TargetOs = linux
+    }
+
+    if p.config.URL == "" {
+        p.config.URL = p.getDownloadUrl()
+    }
 
 	if p.config.DownloadPath == "" {
-		p.config.DownloadPath = fmt.Sprintf("/tmp/goss-%s-linux-%s", p.config.Version, p.config.Arch)
-	}
+        os := strings.ToLower(p.config.TargetOs)
+        if p.config.URL != "" {
+            p.config.DownloadPath = fmt.Sprintf("/tmp/goss-%s-%s-%s", version, os, arch)
+        } else {
+		    p.config.DownloadPath = fmt.Sprintf("/tmp/goss-%s-linux-%s", p.config.Version, p.config.Arch)
+	    }
+    }
 
 	if p.config.RemoteFolder == "" {
 		p.config.RemoteFolder = "/tmp"
@@ -147,6 +176,21 @@ func (p *GossProvisioner) Prepare(raws ...interface{}) error {
 		}
 	}
 
+    if p.config.FormatOptions != "" {
+        valid := false
+        for _, candidate := range validFormatOptions {
+            if p.config.FormatOptions == candidate {
+                valid = true
+                break
+            }
+        }
+        if !valid {
+            errs = packer.MultiErrorAppend(errs,
+                fmt.Errorf("Invalid format options choice %s. Valid options: %v",
+                    p.config.FormatOptions, validFormatOptions))
+        }
+    }
+
 	if len(p.config.Tests) == 0 {
 		errs = packer.MultiErrorAppend(errs,
 			errors.New("tests must be specified"))
@@ -159,6 +203,10 @@ func (p *GossProvisioner) Prepare(raws ...interface{}) error {
 		}
 	}
 
+    if p.config.TargetOs != "" {
+        p.config.TargetOs = linux
+    }
+
 	if errs != nil && len(errs.Errors) > 0 {
 		return errs
 	}
@@ -169,6 +217,7 @@ func (p *GossProvisioner) Prepare(raws ...interface{}) error {
 // Provision runs the Goss GossProvisioner
 func (p *GossProvisioner) Provision(ctx context.Context, ui packer.Ui, comm packer.Communicator, generatedData map[string]interface{}) error {
 	ui.Say("Provisioning with Goss")
+    ui.Say(fmt.Sprintf("Configured to run on %s", string(p.config.TargetOs)))
 
 	if !p.config.SkipInstall {
 		if err := p.installGoss(ui, comm); err != nil {
@@ -196,6 +245,10 @@ func (p *GossProvisioner) Provision(ctx context.Context, ui packer.Ui, comm pack
 			}
 		}
 	}
+
+    if len(p.config.VarsEnv) != 0 {
+        ui.Message(fmt.Sprintf("Env variables are %s", p.envVars()))
+    }
 
 	for _, src := range p.config.Tests {
 		s, err := os.Stat(src)
@@ -236,7 +289,7 @@ func (p *GossProvisioner) Cancel() {
 // installGoss downloads the Goss binary on the remote host
 func (p *GossProvisioner) installGoss(ui packer.Ui, comm packer.Communicator) error {
 	ui.Message(fmt.Sprintf("Installing Goss from, %s", p.config.URL))
-    ctx := context.TODO()
+	ctx := context.TODO()
 
 	cmd := &packer.RemoteCmd{
 		// Fallback on wget if curl failed for any reason (such as not being installed)
@@ -262,7 +315,7 @@ func (p *GossProvisioner) installGoss(ui packer.Ui, comm packer.Communicator) er
 // runGoss runs the Goss tests
 func (p *GossProvisioner) runGoss(ui packer.Ui, comm packer.Communicator) error {
 	goss := fmt.Sprintf("%s", p.config.DownloadPath)
-    ctx := context.TODO()
+	ctx := context.TODO()
 
 	cmd := &packer.RemoteCmd{
 		Command: fmt.Sprintf(
@@ -277,6 +330,40 @@ func (p *GossProvisioner) runGoss(ui packer.Ui, comm packer.Communicator) error 
 	}
 	ui.Say(fmt.Sprintf("Goss tests ran successfully"))
 	return nil
+}
+
+// runGoss tests and render goss commands.
+func (p *GossProvisioner) runGossCmd(ui packer.Ui, comm packer.Communicator, cmd *packer.RemoteCmd, message string) error {
+    ctx := context.TODO()
+    if err := cmd.RunWithUi(ctx, comm, ui); err != nil {
+        return err
+    }
+    if cmd.ExitStatus() != 0 {
+        // Inspect mode is on. Report failure but don't fail.
+        if p.config.Inspect {
+            ui.Say(fmt.Sprintf("Goss %s failed", message))
+            ui.Say(fmt.Sprintf("Inpect mode on : proceeding without failing Packer"))
+        } else {
+            return fmt.Errorf("goss non-zero exit status")
+        }
+    } else {
+        ui.Say(fmt.Sprintf("Goss %s ran successfully", message))
+    }
+    return nil
+}
+
+func (p *GossProvisioner) retryTimeout() string {
+    if p.config.RetryTimeout == "" {
+        return "0s" // goss default
+    }
+    return p.config.RetryTimeout
+}
+
+func (p *GossProvisioner) sleep() string {
+    if p.config.Sleep == "" {
+        return "1s" // goss default
+    }
+    return p.config.Sleep
 }
 
 // debug returns the debug flag if debug is configured
@@ -294,6 +381,13 @@ func (p *GossProvisioner) format() string {
 	return ""
 }
 
+func (p *GossProvisioner) formatOptions() string {
+    if p.config.FormatOptions != "" {
+        return fmt.Sprintf("-o %s", p.config.FormatOptions)
+    }
+    return ""
+}
+
 func (p *GossProvisioner) vars() string {
 	if p.config.VarsFile != "" {
 		return fmt.Sprintf("--vars %s", filepath.ToSlash(filepath.Join(p.config.RemotePath, filepath.Base(p.config.VarsFile))))
@@ -303,7 +397,7 @@ func (p *GossProvisioner) vars() string {
 
 func (p *GossProvisioner) sslFlag(cmdType string) string {
 	if p.config.SkipSSLChk {
-		switch(cmdType) {
+		switch cmdType {
 		case "curl":
 			return "-k"
 		case "wget":
@@ -313,6 +407,40 @@ func (p *GossProvisioner) sslFlag(cmdType string) string {
 		}
 	}
 	return ""
+}
+
+func (p *GossProvisioner) getDownloadUrl() string {
+    os := strings.ToLower(string(p.config.TargetOs))
+    filename := fmt.Sprintf("goss-%s-%s", os, p.config.Arch)
+
+    if p.isGossAlpha() {
+        filename = fmt.Sprintf("goss-alpha-%s-%s", os, p.config.Arch)
+    }
+
+    if p.config.TargetOs == windows {
+        filename = fmt.Sprintf("%s.exe", filename)
+    }
+
+    return fmt.Sprintf("https://github.com/aelsabbahy/goss/releases/download/v%s/%s", p.config.Version, filename)
+}
+
+func (p *GossProvisioner) isGossAlpha() bool {
+    return p.config.VarsEnv["GOSS_USE_ALPHA"] == "1"
+}
+
+func (p *GossProvisioner) envVars() string {
+    var sb strings.Builder
+    for env_var, value := range p.config.VarsEnv {
+        switch p.config.TargetOs {
+        case windows:
+            // Windows requires a call to "set" as separate command seperated by && for each env variable
+            sb.WriteString(fmt.Sprintf("set \"%s=%s\" && ", env_var, value))
+        default:
+            sb.WriteString(fmt.Sprintf("%s=\"%s\" ", env_var, value))
+        }
+
+    }
+    return sb.String()
 }
 
 // enable sudo if required
@@ -326,7 +454,7 @@ func (p *GossProvisioner) enableSudo() string {
 // Deal with curl & wget username and password
 func (p *GossProvisioner) userPass(cmdType string) string {
 	if p.config.Username != "" {
-		switch(cmdType) {
+		switch cmdType {
 		case "curl":
 			if p.config.Password == "" {
 				return fmt.Sprintf("-u %s", p.config.Username)
@@ -338,16 +466,25 @@ func (p *GossProvisioner) userPass(cmdType string) string {
 			}
 			return fmt.Sprintf("--user=%s --password=%s", p.config.Username, p.config.Password)
 		default:
-			return  ""
+			return ""
 		}
 	}
 	return ""
 }
 
+func (p *GossProvisioner) mkDir(dir string) string {
+    switch p.config.TargetOs {
+    case windows:
+        return fmt.Sprintf("powershell /c mkdir -p '%s'", dir)
+    default:
+        return fmt.Sprintf("mkdir -p '%s'", dir)
+    }
+}
+
 // createDir creates a directory on the remote server
 func (p *GossProvisioner) createDir(ui packer.Ui, comm packer.Communicator, dir string) error {
 	ui.Message(fmt.Sprintf("Creating directory: %s", dir))
-    ctx := context.TODO()
+	ctx := context.TODO()
 
 	cmd := &packer.RemoteCmd{
 		Command: fmt.Sprintf("mkdir -p '%s'", dir),
